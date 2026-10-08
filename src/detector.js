@@ -12,7 +12,8 @@ const WINDOW = 600;          // ms, reversals counted within this window
 const V0 = 300;              // px/s, speed at which growth starts
 const ATTACK = 40;           // ms, growth time constant
 const RELEASE = 150;         // ms, shrink time constant
-const MAX_FRAME_DT = 100;    // ms, clamp for frame gaps
+const MAX_FRAME_DT = 100;    // ms; a longer gap (first frame) counts as one frame
+const FRAME_DT = 16;
 
 function clamp(v, lo, hi) {
     return v < lo ? lo : v > hi ? hi : v;
@@ -155,7 +156,9 @@ export class ShakeDetector {
      * @returns {number} displayed scale, exactly 1 when at rest
      */
     advance(now) {
-        const dt = clamp(now - this._frameT, 0, MAX_FRAME_DT);
+        let dt = Math.max(0, now - this._frameT);
+        if (dt > MAX_FRAME_DT)
+            dt = FRAME_DT;
         this._frameT = now;
         const target = this.target(now);
         let s = this._scale;

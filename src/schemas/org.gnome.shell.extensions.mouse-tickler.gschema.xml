@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.mouse-tickler"
+          path="/org/gnome/shell/extensions/mouse-tickler/">
+    <key name="sensitivity" type="i">
+      <range min="1" max="10"/>
+      <default>5</default>
+      <summary>How easily a shake triggers (higher is easier)</summary>
+    </key>
+    <key name="max-scale" type="d">
+      <range min="1.5" max="8.0"/>
+      <default>4.0</default>
+      <summary>Largest cursor size, as a multiple of normal</summary>
+    </key>
+    <key name="growth" type="d">
+      <range min="0.2" max="5.0"/>
+      <default>1.4</default>
+      <summary>Size added per 1000 px/s of shake speed</summary>
+    </key>
+    <key name="hold-ms" type="i">
+      <range min="0" max="2000"/>
+      <default>300</default>
+      <summary>Milliseconds to keep the size after shaking stops</summary>
+    </key>
+    <key name="ignore-fullscreen" type="b">
+      <default>true</default>
+      <summary>Do not trigger over fullscreen windows</summary>
+    </key>
+  </schema>
+</schemalist>

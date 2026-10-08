@@ -1,0 +1,8 @@
+{
+    "uuid": "mouse-tickler@dicostanzo.com",
+    "name": "Mouse Tickler",
+    "description": "Shake the mouse to find it: the cursor grows with how fast you shake, then shrinks back. Lightweight and event-driven; no work while the pointer is still.",
+    "url": "https://github.com/fdicostanzo/mouse-tickler",
+    "settings-schema": "org.gnome.shell.extensions.mouse-tickler",
+    "shell-version": ["50"]
+}
