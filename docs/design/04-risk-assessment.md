@@ -44,7 +44,7 @@ the user.
 | R7 | **False triggers** while drawing, gaming, scrolling maps, or in video | Med | Low–Med: annoying | Suppression rules (doc 03 §7). Unit tests require that straight flicks and tremor do not trigger. |
 | R8 | **GNOME API drift** in 51 and later: `position-invalidated`, `get_sprite` or `TextureNode` change | Med | Med: the extension stops working, but does not crash | Pin `shell-version` to versions we have tested. Feature-check in `enable()`: if the API is missing, log once and stay inert. GNOME then marks the extension as having an error instead of crashing. |
 | R9 | **Interaction with the built-in Magnifier and screen sharing.** Both also inhibit the cursor or draw a sprite. | Low | Low | The inhibit is ref-counted, so it composes. Do not activate while the Magnifier is active (check `Main.magnifier.isActive()`). Test both together. |
-| R10 | **Upscaled sprite looks blurry** | High | Low: cosmetic | Use trilinear filtering. Spike S3 looks for a higher-resolution source. |
+| R10 | **Upscaled sprite looks blurry** | High | Low: cosmetic | LINEAR filtering is acceptable per spike S3. A 96 px Xcursor source is a possible later improvement. |
 | R11 | **Contention on the shared box.** A headless shell run competes with pcrecdev1's suites. | High, if we don't coordinate | Med: corrupts their timings and ours | doc 05 §1: ask pcrecdev1 for a window before every run, wrap runs in `scripts/watchdog`, run one at a time, and run detached with logs. |
 
 ## 3. Recovery playbook (for when the extension is dogfooded on frank's desktop)

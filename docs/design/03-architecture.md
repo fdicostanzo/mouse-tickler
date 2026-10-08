@@ -129,11 +129,11 @@ coordinates.
 - **Shape changes.** While ACTIVE, connect `cursor-changed` and refresh the
   texture and hotspot. Disconnect it on deactivate, so in IDLE the signal costs
   nothing.
-- **Upscaling quality.** Use `Clutter.ScalingFilter.TRILINEAR` for
-  magnification. A 24 px cursor at 4× looks soft but is easy to read. Open
-  question for spike S3: does the Adwaita theme in GNOME 50 give mutter a
-  larger or vector source we could use? Mutter does not expose the shape
-  name, so loading theme files ourselves is deferred until it is measured.
+- **Upscaling quality.** Use `Clutter.ScalingFilter.LINEAR` (spike S3) for
+  magnification. A 24 px cursor at 4× looks soft but is easy to read
+  (`img/s3-filters.png`). The actor needs `request_mode: CONTENT_SIZE`.
+  Adwaita ships Xcursor images up to 96 px, but mutter does not expose the
+  current shape name, so a crisp high-resolution path is deferred.
 - **HiDPI.** Divide the texture's pixel size by the sprite scale
   (`tracker.get_scale()` or the shell's heuristic) to get the logical size.
 

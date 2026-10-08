@@ -76,7 +76,7 @@ not against an absolute number. Record which renderer was used.
 | M | Deliverable | Gate |
 |---|---|---|
 | M0 | Design docs (this set) | User review |
-| M1 | Spikes S1–S4, results added to doc 02 | Every question answered |
+| M1 | Spikes S1–S4, results added to doc 02 | **Done 2026-10-07** (doc 02 §6) |
 | M2 | `detector.js` with unit tests | Unit tests pass |
 | M3 | `extension.js`, `sprite.js`, schema; integration tests | `make test-shell` passes |
 | M4 | `prefs.js`, packaging, lint | `gnome-extensions pack` produces a clean zip |

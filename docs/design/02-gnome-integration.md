@@ -94,3 +94,17 @@ gnome-shell 50.1 JS from `libshell-18.so`'s gresource, and against mutter
 - `--devkit` exists but the `mutter-devkit` viewer binary is **not
   installed**; installing it is the user's call.
 - ESLint: not installed.
+
+## 6. Spike results (M1, 2026-10-07, headless gnome-shell 50.1)
+
+Scripts are in `tests/spikes/` and run through `tests/spikes/run-spike.sh`,
+which isolates them with a private D-Bus session, throwaway XDG dirs, and a
+watchdog bound. Each run took about 5 s of wall time and about 1.3 s of CPU.
+
+| Spike | Result |
+|---|---|
+| S1 motion signal | **0** `position-invalidated` signals in 1 s of idle. **Exactly one signal per motion event**: 200/200 paced events, and 100/100 for a burst injected inside a single frame. There is no compression, so a 1000 Hz mouse means 1000 callbacks per second. **The 4 ms throttle in doc 03 §3 is therefore required, not optional.** |
+| S2 sprite and inhibit | `get_sprite()` returns a 24×24 `Cogl.Texture`. `get_hot()` = `[3,1]` and `get_scale()` = 1 for Adwaita at size 24. `inhibit_cursor_visibility()` changes `get_pointer_visible()` from true to false, and uninhibit changes it back to true. `cursor-changed` fires on the first pointer appearance. |
+| S3 upscaling | See `img/s3-filters.png` (left to right: NEAREST, LINEAR, TRILINEAR, each at 1× and 4×). NEAREST is blocky. LINEAR and TRILINEAR look the same when magnifying and are soft but clean. **Decision: LINEAR.** TRILINEAR would build mipmaps for no gain. The actor **must** use `request_mode: CONTENT_SIZE`, otherwise it has zero size and is invisible. The Adwaita Xcursor files on disk contain sizes 24–96. A future "crisp" option could load the 96 px image of the default arrow, but mutter does not expose the current shape name. This is deferred. |
+| S4 virtual pointer | `seat.create_virtual_device(POINTER_DEVICE)` with `notify_absolute_motion`/`notify_relative_motion` moves the pointer, and `global.get_pointer()` and `tracker.get_pointer()` follow it. Integration tests can drive the extension this way. |
+| APIs | `Clutter.TextureNode` and `Main.magnifier` exist, and `Clutter.ScalingFilter.TRILINEAR` = 2. |
