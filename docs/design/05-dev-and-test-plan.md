@@ -79,8 +79,8 @@ not against an absolute number. Record which renderer was used.
 | M1 | Spikes S1–S4, results added to doc 02 | **Done 2026-10-07** (doc 02 §6) |
 | M2 | `detector.js` with unit tests | **Done 2026-10-07**: 23 tests, each one checked by sabotage |
 | M3 | `extension.js`, `sprite.js`, schema; integration tests | **Done 2026-10-07**: 20 shell checks, including a 600-cycle enable/disable soak |
-| M4 | `prefs.js`, packaging, lint | `gnome-extensions pack` produces a clean zip |
-| M5 | Performance comparison and soak test | Budget in doc 03 §6 met; soak test passes |
+| M4 | `prefs.js`, packaging, lint | **Done except lint** (ESLint is not installed): the prefs window opens in a headless shell with no errors from our code (spike `s6-prefs.js`) |
+| M5 | Performance comparison and soak test | **Done 2026-10-07**, see §7 |
 | M6 | The user installs it on their desktop as frank | Recovery playbook (doc 04 §3) acknowledged |
 
 ## 6. Lessons from the first integration runs (2026-10-07)
@@ -101,3 +101,37 @@ not against an absolute number. Record which renderer was used.
 - Size: the JS totals 518 lines (detector 183, extension 188, sprite 99,
   prefs 48). That is over the 400-line target in doc 03 §1, mostly because of
   comments and defensive code. Accepted for now and to be revisited in review.
+
+## 7. Performance results (M5, 2026-10-07)
+
+Raw data: `docs/results/perf-2026-10-07.txt`. Produced by
+`tests/perf-compare.sh`: 3 interleaved rounds of {no extension,
+mouse-tickler, Jiggle}, each a headless gnome-shell 50.1 running
+`tests/shell/perf.js` with 20 s phases. "Shaking" means 1 s of shaking
+followed by 1 s still, repeated. CPU is gnome-shell's utime+stime across all
+threads. Wake-ups are context switches of the main thread.
+
+| Phase | No extension | mouse-tickler | Jiggle (GNOME 46 port) |
+|---|---|---|---|
+| Idle | 6.0 ms/s, 3.3 wake-ups/s | **4.0 ms/s, 2.3/s** | 20.0 ms/s, **132.6/s** |
+| Moving, no shake | 61.5 ms/s, 237/s | **58.5 ms/s, 233/s** | 86.0 ms/s, 472/s |
+| Shaking (50 % of the time) | 26.4 ms/s, 111/s | 37.9 ms/s, 147/s | 45.4 ms/s, 295/s |
+| Idle after use | 0.5 ms/s, 0.5/s | 1.0 ms/s, 0.9/s | 4.0 ms/s, 30.9/s |
+
+What the numbers show:
+
+- **Idle and plain motion:** mouse-tickler cannot be told apart from having
+  no extension; the differences are smaller than the run-to-run noise. Jiggle
+  adds about 130 wake-ups per second at idle, forever. This confirms the
+  survey's diagnosis (doc 01 §3).
+- **While the effect is showing:** mouse-tickler adds about 11 ms/s (about 1 %
+  of one core, median). The spread is wide (22–58 ms/s). This is mostly
+  compositing the enlarged cursor, which the headless shell does **on the
+  CPU** (llvmpipe, "surfaceless renderer without GPU"). On real hardware that
+  work moves to the GPU.
+- **Jiggle is broken on GNOME 50.** As soon as a shake is detected it throws
+  `TypeError: CursorTracker.get_for_display is not a function`, so its
+  "shaking" number does not include any drawing at all.
+- **Caveats:** the box was running pcrec's 16-thread suites at the same time,
+  and the clock-tick resolution is 0.5 ms/s per 20 s phase. Compare the columns
+  with each other, not with absolute numbers.
