@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+#
+# watchdog — timeout-like supervisor with memory (peak-RSS) limiting and
+# per-execution logging, for wrapping pcrec dev-process commands (compiler
+# invocations, generated-matcher runs, subagent batteries) that can hang or
+# runaway-allocate.
+#
+# Usage:
+#   scripts/watchdog [-l LABEL] [-s SECS] [-m MEM] [-k SECS] [-i SECS]
+#                     [-L FILE] [--] COMMAND [ARG...]
+#   scripts/watchdog -h
+#
+# Why RSS-polling instead of RLIMIT_AS/setrlimit:
+#   RLIMIT_AS caps virtual address space, not resident memory. An ASan (or
+#   MSan) build reserves on the order of tens of terabytes of VA up front as
+#   part of its shadow-memory layout — an RLIMIT_AS limit sized for a real
+#   memory runaway would kill an ASan child instantly, on startup, every
+#   time. VA size also overcounts ordinary mmap'd-but-untouched pages, so
+#   even for non-sanitized builds it does not track "how much memory is this
+#   thing actually using" the way RSS does. Separately, no single-process
+#   rlimit can express a limit over an entire process TREE (a compile that
+#   forks cc1/as/ld), and rlimits don't give you a peak value to put in the
+#   log — you'd still need to poll for that. Polling /proc for tree RSS is
+#   slower and coarser than a kernel-enforced limit, but it is the only
+#   mechanism that answers the question this tool exists to answer: is the
+#   whole tree's resident memory blowing up.
+#
+# Known limitation: sampling can miss a sub-interval spike (allocate past
+# the limit, free it, all inside one poll interval — see -i). This is
+# runaway detection for development use, not a hard security boundary; a
+# real cap would need cgroups. Widen -i is the wrong fix for a real leak;
+# it's a diagnostic tradeoff, not a correctness bug.
+#
+# Options:
+#   -l LABEL   label for the log line (default: basename of COMMAND)
+#   -S SECTION section tag for the log line (default: empty) — which suite or
+#              phase this execution belongs to, so a label like "case7" is
+#              findable among thousands of lines. Best set once per runner
+#              via WATCHDOG_SECTION; every invocation underneath inherits it.
+#   -s SECS    wall-clock timeout (integer or decimal seconds)
+#   -c SECS    CPU-time limit for the whole process tree (summed utime+stime
+#              across the tree, sampled). CPU is load-independent: a busy box
+#              stretches wall time but not the work a child actually does, so
+#              -c is the right primary bound for "is it doing too much work"
+#              while -s catches "stuck without working" (blocked, deadlocked
+#              -- burns no CPU, only wall can see it). Known undercount:
+#              sequential children that exit drop out of the sampled sum.
+#   -m MEM     peak tree RSS limit. Suffix k/m/g (case-insensitive), optional
+#              trailing 'b' (10mb, 512K, 2g all valid); no suffix = bytes.
+#              k/m/g are binary (1024-based), matching /proc's kB unit.
+#   -k SECS    grace period between SIGTERM and SIGKILL (default 2)
+#   -i SECS    poll interval (default 0.2)
+#   -L FILE    log file (default build/watchdog.log, relative to CWD;
+#              its directory is created if missing)
+#   -h         this usage text
+#
+# If NONE of -s/WATCHDOG_TIMEOUT, -c/WATCHDOG_CPU, -m/WATCHDOG_MEM is given,
+# watchdog runs in metrics-only mode: it supervises and logs but never kills.
+#
+# Env vars (Makefile-friendly; CLI flags win over these):
+#   WATCHDOG_LABEL WATCHDOG_SECTION WATCHDOG_TIMEOUT WATCHDOG_CPU
+#   WATCHDOG_MEM WATCHDOG_GRACE WATCHDOG_INTERVAL WATCHDOG_LOG
+#
+# Exit codes:
+#   <child's own exit code>   passed through verbatim
+#   128+N                     child was killed by signal N (its own doing,
+#                             not watchdog's — e.g. it segfaulted)
+#   124                       watchdog wall-clock timeout kill
+#   123                       watchdog CPU-time kill
+#   122                       watchdog memory (peak-RSS) kill
+#   125                       watchdog internal error (bad args, etc.)
+#   126 / 127                 COMMAND found-but-not-executable / not-found
+#                             (setsid/exec's own convention, relayed)
+#
+# stdout is never touched by watchdog — only the child's own stdout appears
+# there. On a breach, watchdog writes exactly one line to stderr. Every
+# execution (not bare usage errors) appends exactly one line to the log.
+
+set -u
+set +b   # suppress bash's own async "Terminated"/"User defined signal N" job
+         # notifications for the backgrounded child — those are bash's
+         # interactive-shell notify feature, not part of watchdog's own
+         # stderr contract; without this a child that dies by signal leaks
+         # an extra, uncontrolled line to our stderr.
+
+prog="watchdog"
+
+usage() {
+    # Usage text is printed to stdout for -h (conventional), never during
+    # a normal run — normal runs never touch stdout at all. The header
+    # comment IS the usage text: print from line 2 to the first
+    # non-comment line, so the range tracks the header as it grows.
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+}
+
+die_usage() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    printf 'Try '"'"'%s -h'"'"' for usage.\n' "$prog" >&2
+    exit 125
+}
+
+# ---- option parsing -------------------------------------------------------
+
+opt_label=""
+opt_section=""
+opt_timeout=""
+opt_cpu=""
+opt_mem=""
+opt_grace=""
+opt_interval=""
+opt_log=""
+have_l=0 have_S=0 have_s=0 have_c=0 have_m=0 have_k=0 have_i=0 have_L=0
+
+while getopts ":l:S:s:c:m:k:i:L:h" opt; do
+    case "$opt" in
+        l) opt_label="$OPTARG"; have_l=1 ;;
+        S) opt_section="$OPTARG"; have_S=1 ;;
+        s) opt_timeout="$OPTARG"; have_s=1 ;;
+        c) opt_cpu="$OPTARG"; have_c=1 ;;
+        m) opt_mem="$OPTARG"; have_m=1 ;;
+        k) opt_grace="$OPTARG"; have_k=1 ;;
+        i) opt_interval="$OPTARG"; have_i=1 ;;
+        L) opt_log="$OPTARG"; have_L=1 ;;
+        h) usage; exit 0 ;;
+        \?) die_usage "unknown option: -$OPTARG" ;;
+        :) die_usage "option -$OPTARG requires an argument" ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [ "$#" -eq 0 ]; then
+    die_usage "no COMMAND given"
+fi
+
+# ---- resolve config: CLI > env > default -----------------------------------
+
+label="$opt_label"
+[ "$have_l" -eq 1 ] || label="${WATCHDOG_LABEL:-}"
+
+section="$opt_section"
+[ "$have_S" -eq 1 ] || section="${WATCHDOG_SECTION:-}"
+
+timeout_secs="$opt_timeout"
+[ "$have_s" -eq 1 ] || timeout_secs="${WATCHDOG_TIMEOUT:-}"
+
+cpu_secs="$opt_cpu"
+[ "$have_c" -eq 1 ] || cpu_secs="${WATCHDOG_CPU:-}"
+
+mem_spec="$opt_mem"
+[ "$have_m" -eq 1 ] || mem_spec="${WATCHDOG_MEM:-}"
+
+grace_secs="$opt_grace"
+[ "$have_k" -eq 1 ] || grace_secs="${WATCHDOG_GRACE:-2}"
+
+interval_secs="$opt_interval"
+[ "$have_i" -eq 1 ] || interval_secs="${WATCHDOG_INTERVAL:-0.2}"
+
+logfile="$opt_log"
+[ "$have_L" -eq 1 ] || logfile="${WATCHDOG_LOG:-build/watchdog.log}"
+
+[ -n "$label" ] || label="$(basename -- "$1")"
+
+# ---- validation -------------------------------------------------------------
+
+is_number() {
+    case "$1" in
+        ''|*[!0-9.]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+if [ -n "$timeout_secs" ] && ! is_number "$timeout_secs"; then
+    die_usage "invalid -s value: $timeout_secs"
+fi
+if [ -n "$cpu_secs" ] && ! is_number "$cpu_secs"; then
+    die_usage "invalid -c value: $cpu_secs"
+fi
+if [ -n "$grace_secs" ] && ! is_number "$grace_secs"; then
+    die_usage "invalid -k value: $grace_secs"
+fi
+if [ -n "$interval_secs" ] && ! is_number "$interval_secs"; then
+    die_usage "invalid -i value: $interval_secs"
+fi
+
+mem_limit_kb=""
+if [ -n "$mem_spec" ]; then
+    if [[ "$mem_spec" =~ ^([0-9]+)([kKmMgG]?)[bB]?$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        # Portable lowercase: `${unit,,}` (bash 4+ case-conversion) is a
+        # PARSE ERROR on bash 3.2, this box's own /bin/bash and the only
+        # bash installed here — verified live, not assumed. `tr` gives the
+        # identical one-byte lowercase on every bash this project targets,
+        # Linux included, so this is a straight portability fix rather
+        # than a platform branch.
+        unit_lc="$(printf '%s' "$unit" | tr '[:upper:]' '[:lower:]')"
+        case "$unit_lc" in
+            k) mem_limit_kb=$(( num )) ;;
+            m) mem_limit_kb=$(( num * 1024 )) ;;
+            g) mem_limit_kb=$(( num * 1024 * 1024 )) ;;
+            '') mem_limit_kb=$(( (num + 1023) / 1024 )) ;;
+        esac
+    else
+        die_usage "invalid -m value: $mem_spec (want e.g. 10mb, 512K, 2g, or a byte count)"
+    fi
+fi
+
+# ---- portability probes (resolved ONCE; every branch below reads these
+# rather than re-testing) --------------------------------------------------
+#
+# _WD_HAVE_PROC: Linux's /proc is the fast, already-proven path (collect_stats
+# /proc_running below); this project's other supported box (macOS/arm64) has
+# none, so those two functions gain a `ps`-based twin instead of requiring it.
+if [ -d /proc ] && [ -r /proc/self/stat ]; then
+    _WD_HAVE_PROC=1
+else
+    _WD_HAVE_PROC=0
+fi
+
+# _WD_HAVE_SETSID: util-linux's setsid(1) is what gives the child its own
+# session (pid == sid == pgid, load-bearing for the whole-tree TERM/KILL
+# below) — absent on macOS, which ships no util-linux at all. _wd_setsid
+# below falls back to a one-line perl wrapper around the SAME setsid(2)
+# syscall (POSIX::setsid, present in every macOS system perl) rather than a
+# job-control approximation (`set -m` + backgrounding): perl's setsid()-then-
+# exec-in-place reproduces "pid == sid == pgid" exactly, so `pgid="$child_pid"`
+# below stays true on both platforms with no ps-query-for-pgid fallback
+# needed — verified live on this box (a perl-launched child reparents to
+# pid 1 with pgid == its own pid, the same signature setsid(1) gives on
+# Linux).
+_WD_HAVE_SETSID=0
+command -v setsid >/dev/null 2>&1 && _WD_HAVE_SETSID=1
+if [ "$_WD_HAVE_SETSID" -eq 0 ] && ! command -v perl >/dev/null 2>&1; then
+    printf '%s: neither setsid nor perl found (need one to give the child its own session)\n' "$prog" >&2
+    exit 125
+fi
+
+_wd_setsid() {
+    if [ "$_WD_HAVE_SETSID" -eq 1 ]; then
+        exec setsid "$@"
+    else
+        exec perl -e 'use POSIX qw(setsid); setsid(); exec { $ARGV[0] } @ARGV or exit 127;' -- "$@"
+    fi
+}
+
+mkdir -p "$(dirname -- "$logfile")" 2>/dev/null || {
+    printf '%s: cannot create log directory for %s\n' "$prog" "$logfile" >&2
+    exit 125
+}
+
+metrics_only=1
+[ -n "$timeout_secs" ] && metrics_only=0
+[ -n "$cpu_secs" ] && metrics_only=0
+[ -n "$mem_limit_kb" ] && metrics_only=0
+
+# ---- helpers ----------------------------------------------------------------
+
+clk_tck="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+
+# proc_running PID: true if PID exists and is not a zombie (i.e. still
+# actually running, not merely un-reaped).
+proc_running() {
+    if [ "$_WD_HAVE_PROC" -eq 1 ]; then
+        local pid="$1" line="" state
+        { read -r line < "/proc/$pid/stat"; } 2>/dev/null
+        [ -n "$line" ] || return 1
+        line="${line##*) }"
+        state="${line%% *}"
+        [ "$state" != "Z" ]
+    else
+        # darwin: no /proc. `ps -o stat=` is the same "does it exist, is
+        # it a zombie" question BSD ps answers directly — first character
+        # 'Z' is zombie in ps(1)'s STAT column on every BSD derivative,
+        # macOS included (verified live on this box).
+        local pid="$1" stat
+        stat="$(ps -o stat= -p "$pid" 2>/dev/null)"
+        [ -n "$stat" ] || return 1
+        case "$stat" in
+            Z*) return 1 ;;
+            *)  return 0 ;;
+        esac
+    fi
+}
+
+# collect_stats PGID: prints "RSS_KB CPU_TICKS" summed over every process
+# whose process group is PGID. Best-effort: entries that vanish mid-scan
+# (race with process exit) are silently skipped rather than treated as an
+# error, on both platforms.
+collect_stats() {
+    if [ "$_WD_HAVE_PROC" -eq 1 ]; then
+        local pgid="$1" rss_kb=0 ticks=0
+        local statfile pid line rest state ppid pgrp session tty tpgid flags \
+              minflt cminflt majflt cmajflt utime stime
+        for statfile in /proc/[0-9]*/stat; do
+            line=""
+            { read -r line < "$statfile"; } 2>/dev/null
+            [ -n "$line" ] || continue
+            rest="${line##*) }"
+            read -r state ppid pgrp session tty tpgid flags minflt cminflt \
+                    majflt cmajflt utime stime _rest <<<"$rest"
+            [ "$pgrp" = "$pgid" ] || continue
+            pid="${statfile#/proc/}"
+            pid="${pid%/stat}"
+            ticks=$(( ticks + utime + stime ))
+            {
+                while IFS=: read -r key val; do
+                    if [ "$key" = "VmRSS" ]; then
+                        val="${val//kB/}"
+                        val="${val// /}"
+                        val="${val//$'\t'/}"
+                        [ -n "$val" ] && rss_kb=$(( rss_kb + val ))
+                        break
+                    fi
+                done < "/proc/$pid/status"
+            } 2>/dev/null
+        done
+        printf '%s %s\n' "$rss_kb" "$ticks"
+    else
+        # darwin: no /proc, so this is one `ps` call for the WHOLE box
+        # (never one per process — that would be the same per-call-
+        # subprocess cost tests/lib/timeout_bin.sh's own header measured
+        # and rejected for `timeout`) filtered and summed in one awk pass.
+        # `rss` is already kB in BSD ps's own units (no clock-tick/getconf
+        # dance needed there); `cputime` is `[[dd-]hh:]mm:ss[.ss]` and is
+        # parsed into seconds, then reported as TICKS at $clk_tck (== 100
+        # on this box, same as Linux's own getconf CLK_TCK default) so
+        # every caller below — which divides by $clk_tck to get seconds —
+        # reads an identical unit regardless of platform.
+        local pgid="$1"
+        ps -axo pgid=,rss=,cputime= 2>/dev/null | awk -v pg="$pgid" -v tck="$clk_tck" '
+            $1 != pg { next }
+            {
+                rss_sum += $2
+                t = $3
+                days = 0; rest = t
+                if (index(t, "-") > 0) { split(t, da, "-"); days = da[1] + 0; rest = da[2] }
+                n = split(rest, p, ":")
+                secs  = p[n] + 0
+                mins  = (n >= 2) ? p[n-1] + 0 : 0
+                hours = (n >= 3) ? p[n-2] + 0 : 0
+                cpu_sum += days*86400 + hours*3600 + mins*60 + secs
+            }
+            END { printf "%d %d\n", rss_sum + 0, (cpu_sum * tck) + 0.5 }
+        '
+    fi
+}
+
+# sq_quote STRING: single-quote-escape STRING for a one-line, shell-parseable
+# log field (newlines flattened to spaces first).
+sq_quote() {
+    local s="${1//$'\n'/ }"
+    printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
+now_epoch() { date +%s.%N; }
+
+# ---- run the child ------------------------------------------------------
+
+# <&0 is load-bearing: a background job in a job-control-less shell gets its
+# stdin implicitly redirected from /dev/null "in the absence of any explicit
+# redirections" (POSIX), so without it every wrapped command that reads stdin
+# silently reads EOF instead — found in the wild when a wrapped test driver
+# read zero subjects from its redirected stdin and its cell count fell to 0
+# while every other number stayed plausible. Explicitly duplicating fd 0 onto
+# itself is the defined way to defeat the implicit redirect.
+_wd_setsid "$@" <&0 &
+child_pid=$!
+pgid="$child_pid"   # setsid() with no forced fork makes pid==sid==pgid,
+                    # on both the util-linux binary and the perl fallback
+
+# The child (forked above) has already inherited the real stderr on fd 2.
+# From here on, silence the PARENT's own fd 2 and keep a saved duplicate on
+# fd 3 for watchdog's own breach message: bash prints an asynchronous
+# "Terminated"/"User defined signal N" job-notify line to the shell's
+# CURRENT fd 2 whenever it next gets to check on a backgrounded job that
+# died abnormally (a bash shell-interaction feature, unrelated to and not
+# reliably suppressed by redirecting any single `wait` invocation) — this
+# is not part of watchdog's stderr contract, and would otherwise leak an
+# uncontrolled extra line for e.g. a child killed by its own signal.
+exec 3>&2 2>/dev/null
+
+start_epoch="$(now_epoch)"
+peak_rss_kb=0
+peak_cpu_ticks=0
+verdict="ok"
+breach=""
+
+while :; do
+    read -r rss ticks <<<"$(collect_stats "$pgid")"
+    [ "${rss:-0}" -gt "$peak_rss_kb" ] && peak_rss_kb="$rss"
+    [ "${ticks:-0}" -gt "$peak_cpu_ticks" ] && peak_cpu_ticks="$ticks"
+
+    proc_running "$child_pid" || break
+
+    if [ "$metrics_only" -eq 0 ]; then
+        now="$(now_epoch)"
+        elapsed="$(awk -v a="$now" -v b="$start_epoch" 'BEGIN{printf "%.3f", a-b}')"
+
+        if [ -n "$timeout_secs" ] && awk -v e="$elapsed" -v t="$timeout_secs" 'BEGIN{exit !(e>t)}'; then
+            verdict="timeout"
+            breach="wall timeout after ${timeout_secs}s"
+            break
+        fi
+        if [ -n "$mem_limit_kb" ] && [ "$peak_rss_kb" -gt "$mem_limit_kb" ]; then
+            verdict="memkill"
+            breach="memory limit exceeded (limit ${mem_limit_kb} kB)"
+            break
+        fi
+        if [ -n "$cpu_secs" ] && awk -v t="$peak_cpu_ticks" -v c="$clk_tck" -v l="$cpu_secs" 'BEGIN{exit !(t/c > l)}'; then
+            verdict="cpukill"
+            breach="CPU limit exceeded (limit ${cpu_secs}s of CPU time)"
+            break
+        fi
+    fi
+
+    sleep "$interval_secs"
+done
+
+exit_code=""
+
+if [ -n "$breach" ]; then
+    kill -TERM "-$pgid" 2>/dev/null
+
+    waited="0"
+    while proc_running "$child_pid" && awk -v w="$waited" -v g="$grace_secs" 'BEGIN{exit !(w<g)}'; do
+        sleep "$interval_secs"
+        read -r rss ticks <<<"$(collect_stats "$pgid")"
+        [ "${rss:-0}" -gt "$peak_rss_kb" ] && peak_rss_kb="$rss"
+        [ "${ticks:-0}" -gt "$peak_cpu_ticks" ] && peak_cpu_ticks="$ticks"
+        waited="$(awk -v w="$waited" -v s="$interval_secs" 'BEGIN{printf "%.3f", w+s}')"
+    done
+    if proc_running "$child_pid"; then
+        kill -KILL "-$pgid" 2>/dev/null
+    fi
+
+    wait "$child_pid" 2>/dev/null
+    printf '%s: %s: %s (TERM->KILL), peak rss %s kB\n' "$prog" "$label" "$breach" "$peak_rss_kb" >&3
+
+    case "$verdict" in
+        timeout) exit_code=124 ;;
+        cpukill) exit_code=123 ;;
+        memkill) exit_code=122 ;;
+    esac
+else
+    # 2>/dev/null: suppresses bash's own async "Terminated"/"User defined
+    # signal N" job-notify message for the backgrounded child (a bash
+    # shell-interaction feature, not part of watchdog's stderr contract);
+    # it does NOT affect the child's own stderr, which was never routed
+    # through this fd — the child's fds are inherited untouched from launch.
+    wait "$child_pid" 2>/dev/null
+    exit_code=$?
+    if [ "$exit_code" -eq 126 ] || [ "$exit_code" -eq 127 ]; then
+        verdict="exec-fail"
+    elif [ "$exit_code" -gt 128 ]; then
+        verdict="signal"
+    fi
+fi
+
+exec 2>&3 3>&-   # restore real stderr; drop the saved duplicate
+
+end_epoch="$(now_epoch)"
+wall="$(awk -v a="$end_epoch" -v b="$start_epoch" 'BEGIN{printf "%.2f", a-b}')"
+cpu="$(awk -v t="$peak_cpu_ticks" -v c="$clk_tck" 'BEGIN{printf "%.2f", t/c}')"
+# -Iseconds (not GNU's -Is shorthand): identical output on GNU date, and the
+# only spelling BSD/macOS date accepts — verified live on this box, both
+# spellings produce the same "YYYY-MM-DDTHH:MM:SS+HHMM"-shaped string on
+# GNU coreutils. Not a platform branch: this line is unchanged on Linux.
+ts="$(date -Iseconds)"
+cmd_str="$*"
+
+log_line="$(printf 'ts=%s section=%s label=%s verdict=%s wall=%s cpu=%s peak_rss_kb=%s exit=%s cmd=%s' \
+    "$ts" "$(sq_quote "$section")" "$(sq_quote "$label")" "$verdict" "$wall" "$cpu" "$peak_rss_kb" "$exit_code" "$(sq_quote "$cmd_str")")"
+
+if command -v flock >/dev/null 2>&1; then
+    (
+        flock -x 200
+        printf '%s\n' "$log_line" >> "$logfile"
+    ) 200>>"$logfile.lock" 2>/dev/null || printf '%s\n' "$log_line" >> "$logfile"
+else
+    # No util-linux flock (macOS ships none, and this project's mandate
+    # forbids installing one via Homebrew just for this). `mkdir` is
+    # atomic on every filesystem this project runs on (APFS included) and
+    # doubles as a portable mutex; bounded spin (never a fixed sleep) so a
+    # loaded box slows this down rather than flaking it, and a lock that
+    # somehow never clears (a killed holder) cannot wedge every future
+    # watchdog invocation forever.
+    _wd_lockdir="$logfile.lockdir"
+    _wd_tries=0
+    while ! mkdir "$_wd_lockdir" 2>/dev/null; do
+        _wd_tries=$((_wd_tries + 1))
+        [ "$_wd_tries" -ge 500 ] && break   # ~5s worst case at the 0.01s poll below
+        sleep 0.01
+    done
+    printf '%s\n' "$log_line" >> "$logfile"
+    rmdir "$_wd_lockdir" 2>/dev/null
+fi
+
+exit "$exit_code"

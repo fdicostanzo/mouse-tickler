@@ -1,0 +1,753 @@
+#!/usr/bin/env bash
+#
+# safekill — kill a process tree without the collateral-kill failure mode
+# that `pkill -f` keeps producing in this project.
+#
+# WHY THIS EXISTS. Two incidents on 2026-08-19, hours apart, same shape:
+#   Incident A (wave B lane): `pkill -f` against a stale mech scratch-root
+#   pattern killed a CONCURRENT, legitimate mech run as collateral (it
+#   reported FATAL / 0 rows). First-recorded lesson: "never pkill -f a
+#   pattern while another run of the same tool is live; kill by exact PID."
+#   Incident B (the manager, same day): stopped a duplicate matrix run via
+#   the task API — fine — then "cleaned up" with `pkill -f
+#   run_sabotage_matrix`, which killed the OTHER, canonical run's live
+#   child mid-row. The victim's log just stopped: no trailer, no FATAL,
+#   because SIGTERM never reached the script's own accounting.
+# THE SHARPENED LESSON (wave C's analysis): A COMMAND LINE IS NOT AN
+# IDENTITY. Two legitimate concurrent invocations of the same tool are
+# INDISTINGUISHABLE under any -f pattern — no amount of operator care
+# fixes that — and the pattern can also match the caller's OWN wrapper
+# shell (a `bash -c '...pattern text...'` matches itself; this is the root
+# of this project's standing "never pgrep -f to poll liveness" rule,
+# docs/dev/learnings.md section 6). The durable fixes, ordered by how
+# little they ask of someone under pressure: kill the PROCESS GROUP of the
+# shell you launched, or the recorded PID — never a name pattern. safekill
+# makes the first the effortless default and keeps the second narrow and
+# refuse-by-default on purpose.
+#
+# DESIGN CONSEQUENCES, each answering one incident:
+#   - The PAVED ROAD is "I have a PID" (the common case: you started
+#     something, you recorded its PID). safekill PID kills that PID's
+#     process group AND its descendant tree (union of both — a
+#     double-forked/daemonizing descendant can escape one mechanism but not
+#     both: reparented-to-init but same pgid is caught by the group kill;
+#     self-setsid'd into a new group but still a ppid-descendant is caught
+#     by the tree walk). One call, no flags, safe by construction.
+#   - The DANGEROUS ROAD is "I only have a pattern" (-f/--pattern). This
+#     path is deliberately narrow: it lists candidates from raw /proc reads
+#     ONLY — never `ps`/`pgrep`/any subprocess whose own argv could carry
+#     the pattern text and match itself, which is exactly how a polling
+#     wrapper self-matches under `pgrep -f` per the learnings.md rule.
+#     Every candidate that is safekill's own PID or an ANCESTOR of the
+#     caller (the whole chain up to PID 1, walked via /proc, unconditional,
+#     no override flag: this is the "wrapper shell carries the pattern
+#     text" failure reproduced exactly, and an override flag would just
+#     re-open the hole) is dropped before anything else happens. If more
+#     than one candidate remains, safekill REFUSES — this is incident
+#     A/B's shape in miniature, two legitimate same-command-line processes
+#     — unless --all is given explicitly. Refusal, not a guess.
+#   - NEVER interactive. Agents cannot answer a confirmation prompt (they
+#     are not attached to a terminal that will ever see one), so a design
+#     that "asks before an ambiguous kill" would just hang or silently
+#     skip the prompt depending on harness plumbing. Safety comes entirely
+#     from refuse-by-default plus explicit flags, never a question.
+#   - Every process actually signalled gets an audit line printed as it
+#     happens: pid, pgid, start time, command — exactly the fields a
+#     postmortem needs to answer "what did this kill and was it right",
+#     which is precisely what incident B's victim log could NOT answer
+#     (SIGTERM landed with zero accounting on the receiving end). The
+#     audit line is WRITTEN BEFORE the signal is sent, not after — a TERM
+#     racing this script's own accounting would reproduce incident B's
+#     zero-accounting failure in miniature. A process that already exited
+#     between the /proc snapshot and the kill() call (TOCTOU — inherent to
+#     any snapshot-then-act design) is not treated as a failure: the
+#     signal targets the process GROUP, not the individually snapshotted
+#     pids, so a vanished member simply is not there to receive it, and
+#     `kill`'s own ESRCH for a fully-vanished group is deliberately
+#     unchecked — "already dead" is success for this tool, not an error.
+#   - Candidate scope narrower than the whole box, for the pattern path:
+#     --under PID restricts candidates to PID's descendant tree (reliable
+#     via /proc's ppid chain) and --cwd DIR restricts to processes whose
+#     /proc/PID/cwd resolves under DIR (reliable via readlink, best-effort
+#     for another user's processes whose cwd this UID cannot read — such
+#     candidates are excluded, not treated as a hard error, but COUNTED:
+#     any message reporting a candidate count under --cwd notes how many
+#     were excluded as unreadable, so "no match" is never confused with
+#     "matches existed but were unreadable" without needing a new exit
+#     code for it. Same-session
+#     scoping was considered and NOT built as a default filter: incident
+#     A/B's two collisions were both async/background invocations that may
+#     not share a session with the caller, so defaulting to session-scope
+#     would have hidden the exact case this tool exists to handle safely;
+#     --under is the equivalent narrowing tool when the caller has
+#     something to anchor on.
+#   - Signal choice: TERM by default, escalate to KILL after a grace period
+#     (--grace SECS, default 3) unless --term-only (never escalate) or
+#     --kill-now/-K (skip TERM, go straight to KILL — for the genuinely
+#     stuck). The escalation poll checks survivors in short increments
+#     rather than sleeping the full grace, matching scripts/watchdog's
+#     TERM->KILL shape.
+#   - Exit codes are distinct on purpose so a caller can branch without
+#     parsing text: 0 killed something, 1 nothing matched (not an error —
+#     "already dead" is a fine outcome), 2 refused (ambiguous -f match,
+#     needs --all), 125 usage error. See EXIT CODES below.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO (so a future reader does not propose
+# rebuilding it): no confirmation prompts, ever — see above. No config
+# file, no daemon/watch mode, no cross-machine kill, no privilege
+# escalation (a candidate this UID cannot signal is reported and skipped,
+# never sudo'd). No override for the self/ancestor exclusion — the one
+# guard this tool has that the incidents show a human cannot reliably
+# apply by hand, so it does not get a bypass flag. No "kill everything
+# matching, no questions" default — --all exists and is one flag away, but
+# the operator has to choose it, matching the incident record's actual
+# lesson (operator care did not scale; refuse-by-default does).
+#
+# Usage:
+#   scripts/safekill [OPTIONS] PID                # paved road: group+tree
+#   scripts/safekill [OPTIONS] --pgid PGID         # exact group, no tree
+#   scripts/safekill [OPTIONS] -f PATTERN          # narrow, refuse-by-default
+#   scripts/safekill -h
+#
+# Options:
+#   --pgid PGID     target an explicit process group id instead of a PID
+#                   (kills exactly that group's current membership; no
+#                   descendant-tree walk — PGID is already the whole ask)
+#   -f, --pattern PAT
+#                   match candidates by POSIX-ERE search against each
+#                   process's full /proc/PID/cmdline (pkill -f's semantics:
+#                   a search, not an anchored match). Dangerous path — see
+#                   above. Self/ancestor candidates are dropped first,
+#                   unconditionally; >1 remaining candidate REFUSES
+#                   (exit 2) unless --all is given.
+#   -a, --all       required to proceed when -f/--pattern matches more than
+#                   one candidate after exclusions. Usage error with PID or
+#                   --pgid targets (there is no ambiguity to widen there).
+#   -n, --list      list matching candidates (pid/pgid/start/cmd) to stdout
+#                   and exit WITHOUT signalling anything. Works with any
+#                   target form; bypasses the ambiguity refusal (nothing is
+#                   killed, so nothing needs refusing) — this is the safe
+#                   way to preview a -f pattern before widening with --all.
+#   --under PID     (with -f/--pattern only) restrict candidates to PID's
+#                   descendant tree.
+#   --cwd DIR       (with -f/--pattern only) restrict candidates to
+#                   processes whose cwd resolves under DIR.
+#   -s, --signal SIG
+#                   initial signal, name or number (default TERM).
+#   --grace SECS    seconds between the initial signal and KILL escalation
+#                   (default 3).
+#   --term-only     send the initial signal only; never escalate to KILL
+#                   even if survivors remain after --grace.
+#   -K, --kill-now  send KILL immediately — no initial signal, no grace.
+#   -h, --help      this text.
+#
+# Exit codes:
+#   0    at least one process was signalled.
+#   1    no candidates matched (already dead, or the pattern/PID/PGID
+#        found nothing) — not treated as an error.
+#   2    refused: -f/--pattern matched more than one candidate after
+#        exclusions and --all was not given.
+#   125  usage error (bad arguments, target not found for --list, etc.).
+#
+# Mechanism notes: candidate discovery reads /proc/[0-9]*/stat,
+# /proc/PID/cmdline and /proc/PID/cwd directly — no `ps`, no `pgrep`, no
+# subprocess of any kind is spawned to find candidates, so there is no
+# wrapper argv for a pattern to self-match against during discovery (only
+# safekill's OWN argv can do that, and the ancestor-chain exclusion covers
+# exactly that). Best-effort like scripts/watchdog's collect_stats: a
+# process that exits mid-scan is silently skipped rather than treated as
+# an error, and a candidate whose cwd this UID cannot read is excluded
+# from --cwd matching rather than aborting the run.
+#
+# [MACPORT] darwin has no /proc at all, so candidate discovery there reads
+# three WHOLE-BOX `ps` calls (never one per candidate) plus, for --cwd
+# only, one `lsof -d cwd` call PER CANDIDATE already narrowed by the
+# pattern match (never over the whole box). Neither is the hole the /proc
+# design avoids: every one of those commands' own argv is a FIXED literal
+# (`ps -axo pid=,ppid=,pgid=`, `lsof -a -p N -d cwd -Fn`, ...) that never
+# contains the CALLER's search pattern, so none of them can self-match the
+# way a `pgrep -f PATTERN` polling wrapper's argv does — the property this
+# file's header is protecting stays true, the mechanism finding it is just
+# not /proc.
+
+set -u
+
+prog="safekill"
+
+usage() {
+    # Same trick as scripts/watchdog: the header comment IS the usage text.
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+}
+
+die_usage() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    printf "Try '%s -h' for usage.\n" "$prog" >&2
+    exit 125
+}
+
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_number() {
+    case "$1" in
+        ''|*[!0-9.]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# sq STRING: single-quote-escape STRING for a one-line, greppable field
+# (newlines flattened first) — same shape as scripts/watchdog's sq_quote.
+sq() {
+    local s="${1//$'\n'/ }"
+    printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
+# ---- option parsing (long options -> no getopts; hand-rolled) -------------
+
+mode=""              # "" | pid | pgid | pattern
+target_pid=""
+target_pgid=""
+pattern=""
+opt_all=0
+opt_list=0
+opt_under=""
+opt_cwd=""
+opt_signal="TERM"
+opt_grace="3"
+opt_termonly=0
+opt_killnow=0
+cwd_unreadable_count=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --pgid)
+            [ $# -ge 2 ] || die_usage "--pgid requires an argument"
+            [ -z "$mode" ] || die_usage "only one target form allowed (PID / --pgid / --pattern)"
+            target_pgid="$2"; mode="pgid"; shift 2 ;;
+        -f|--pattern)
+            [ $# -ge 2 ] || die_usage "$1 requires an argument"
+            [ -z "$mode" ] || die_usage "only one target form allowed (PID / --pgid / --pattern)"
+            pattern="$2"; mode="pattern"; shift 2 ;;
+        -a|--all) opt_all=1; shift ;;
+        -n|--list) opt_list=1; shift ;;
+        --under)
+            [ $# -ge 2 ] || die_usage "--under requires an argument"
+            opt_under="$2"; shift 2 ;;
+        --cwd)
+            [ $# -ge 2 ] || die_usage "--cwd requires an argument"
+            opt_cwd="$2"; shift 2 ;;
+        -s|--signal)
+            [ $# -ge 2 ] || die_usage "$1 requires an argument"
+            opt_signal="$2"; shift 2 ;;
+        --grace)
+            [ $# -ge 2 ] || die_usage "--grace requires an argument"
+            opt_grace="$2"; shift 2 ;;
+        --term-only) opt_termonly=1; shift ;;
+        -K|--kill-now) opt_killnow=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) die_usage "unknown option: $1" ;;
+        *)
+            [ -z "$mode" ] || die_usage "only one target form allowed (PID / --pgid / --pattern)"
+            target_pid="$1"; mode="pid"; shift ;;
+    esac
+done
+[ $# -eq 0 ] || die_usage "unexpected extra argument: $1"
+[ -n "$mode" ] || die_usage "no target given (PID, --pgid PGID, or -f/--pattern PAT required)"
+
+case "$mode" in
+    pid)  is_uint "$target_pid"  || die_usage "PID must be a positive integer: $target_pid" ;;
+    pgid) is_uint "$target_pgid" || die_usage "PGID must be a positive integer: $target_pgid" ;;
+esac
+if [ -n "$opt_under" ] && [ "$mode" != "pattern" ]; then
+    die_usage "--under is only valid with -f/--pattern"
+fi
+if [ -n "$opt_cwd" ] && [ "$mode" != "pattern" ]; then
+    die_usage "--cwd is only valid with -f/--pattern"
+fi
+if [ "$opt_all" -eq 1 ] && [ "$mode" != "pattern" ]; then
+    die_usage "--all is only valid with -f/--pattern"
+fi
+if [ -n "$opt_under" ]; then
+    is_uint "$opt_under" || die_usage "--under expects a PID: $opt_under"
+fi
+is_number "$opt_grace" || die_usage "--grace expects a non-negative number: $opt_grace"
+if [ "$opt_termonly" -eq 1 ] && [ "$opt_killnow" -eq 1 ]; then
+    die_usage "--term-only and --kill-now are mutually exclusive"
+fi
+
+# ---- portability probes ([MACPORT]; resolved once, every branch below
+# reads these rather than re-testing) ---------------------------------------
+#
+# _SK_HAVE_PROC: this project's other supported box (macOS/arm64) has no
+# /proc at all — scan_procs below gains a `ps`-based twin instead of
+# requiring it (three whole-box `ps` calls total, never one per pid — the
+# same "no subprocess whose own argv could self-match" discipline this
+# file's header already states for /proc, extended to a bulk `ps` read
+# rather than a per-candidate one).
+if [ -d /proc ] && [ -r /proc/self/stat ]; then
+    _SK_HAVE_PROC=1
+else
+    _SK_HAVE_PROC=0
+fi
+# _SK_HAVE_ASSOC: bash 3.2 (this box's own /bin/bash, verified — no newer
+# bash was installed by this lane) has NO associative arrays at all
+# (`declare -A` errors "invalid option", confirmed live). Every key this
+# file uses — PGRP/PPIDOF/START/CMD/CHILDREN/SELF_CHAIN/pgset/under_set/
+# seen — is always a PID or a PGID, i.e. already a non-negative integer, so
+# a PLAIN INDEXED array (which bash 3.2 has always supported) answers every
+# lookup and iteration here identically to an associative one; `-A` stays
+# on bash 4+ so nothing changes there.
+#
+# EVERY declare/local BELOW BRANCHES ON THIS WITH A LITERAL -A/-a, never a
+# variable holding the flag (`declare "$flag" NAME=()`) — verified live to
+# be a genuine bash parser gotcha, not a style choice: bash parses the
+# `NAME=()` compound-assignment operand as an INDEXED-array literal
+# whenever the preceding flag is not the literal token `-A` at PARSE time,
+# regardless of what a substituted flag variable holds at RUN time, and
+# then refuses to convert the just-created indexed array to associative
+# ("declare: NAME: cannot convert indexed to associative array") — this
+# reproduces on a trivial two-line script (`v=-A; declare "$v" x=()`) with
+# no other code involved.
+_SK_HAVE_ASSOC=1
+[ "${BASH_VERSINFO:-0}" -ge 4 ] 2>/dev/null || _SK_HAVE_ASSOC=0
+
+# ---- process snapshot: pure reads, minimal subprocesses (see header) ------
+
+if [ "$_SK_HAVE_ASSOC" -eq 1 ]; then
+    declare -A PGRP=() PPIDOF=() START=() CMD=()
+    declare -A CHILDREN=()     # ppid -> space-separated child pids
+    declare -A SELF_CHAIN=()   # safekill's own pid + every ancestor up to pid 1
+else
+    declare -a PGRP=() PPIDOF=() START=() CMD=()
+    declare -a CHILDREN=()
+    declare -a SELF_CHAIN=()
+fi
+BOOT_EPOCH=""
+CLK_TCK=""
+
+# read_cmdline PID: NUL-delimited args joined with spaces, via bash's own
+# `read -d ''` (a builtin) — no tr/xargs/subprocess, so nothing here can add
+# transient noise to a live /proc scan.
+read_cmdline() {
+    local out="" part first=1
+    while IFS= read -r -d '' part; do
+        if [ "$first" -eq 1 ]; then out="$part"; first=0; else out="$out $part"; fi
+    done < "/proc/$1/cmdline" 2>/dev/null
+    printf '%s' "$out"
+}
+
+scan_procs() {
+    if [ "$_SK_HAVE_PROC" -eq 1 ]; then
+        scan_procs_linux
+    else
+        scan_procs_darwin
+    fi
+}
+
+scan_procs_linux() {
+    local statfile pid line rest comm state ppid pgrp session tty tpgid flags \
+          minflt cminflt majflt cmajflt utime stime cutime cstime priority nice \
+          numthreads itrealvalue starttime _rest
+    for statfile in /proc/[0-9]*/stat; do
+        line=""
+        { read -r line < "$statfile"; } 2>/dev/null
+        [ -n "$line" ] || continue
+        pid="${statfile#/proc/}"; pid="${pid%/stat}"
+        comm="${line#*(}"; comm="${comm%)*}"
+        rest="${line##*) }"
+        read -r state ppid pgrp session tty tpgid flags minflt cminflt majflt \
+                cmajflt utime stime cutime cstime priority nice numthreads \
+                itrealvalue starttime _rest <<<"$rest"
+        [ -n "${ppid:-}" ] || continue
+        PGRP[$pid]="$pgrp"
+        PPIDOF[$pid]="$ppid"
+        START[$pid]="$starttime"
+        CMD[$pid]="$(read_cmdline "$pid")"
+        [ -n "${CMD[$pid]}" ] || CMD[$pid]="[$comm]"
+        CHILDREN[$ppid]="${CHILDREN[$ppid]:-}${CHILDREN[$ppid]:+ }$pid"
+    done
+}
+
+# scan_procs_darwin: ONE whole-box `ps` call (never one per candidate —
+# that would reproduce the very "subprocess whose argv could self-match"
+# shape this file's header rules out for /proc). pid/ppid/pgid are kept as
+# fixed-width NUMERIC columns and command is requested LAST, so
+# `read -r pid ppid pgrp rest` can safely slurp "everything after the
+# first three fields, embedded spaces included" for the one column that
+# needs it.
+#
+# [MACPORT] THIS USED TO BE THREE SEPARATE `ps` CALLS (pid/ppid/pgid,
+# lstart, command), and the gap between the FIRST and THIRD widened this
+# tool's own inherent TOCTOU race far enough to matter, measured live: a
+# transient process born after call 1 but still alive at call 3 got a CMD
+# entry with no PGRP/PPIDOF entry, which (a) crashed `pgset[...]=1` under
+# `set -u` with no default (fixed separately, see below) and (b) — the
+# sharper finding — was a WRAPPER PROCESS CARRYING THE CALLER'S OWN
+# PATTERN IN ITS ARGV that self-chain exclusion never got a chance to
+# examine, because it only ever existed in the `matched` list, never in
+# `PPIDOF`, so the ancestor walk could not find it. That is precisely the
+# self-match hazard this file's header exists to rule out, reopened by an
+# avoidable multi-call race rather than by anything fundamental about
+# lacking /proc. One call for the three array-populating fields closes
+# that specific gap; `lstart` (the one field that does NOT feed a safety
+# decision, only the printed audit line) moved to a per-candidate lazy
+# fetch in `iso_of` below, off the hot/wide scan entirely.
+scan_procs_darwin() {
+    local pid ppid pgrp rest
+    while read -r pid ppid pgrp rest; do
+        [ -n "${pid:-}" ] || continue
+        PGRP[$pid]="$pgrp"
+        PPIDOF[$pid]="$ppid"
+        CHILDREN[$ppid]="${CHILDREN[$ppid]:-}${CHILDREN[$ppid]:+ }$pid"
+        # `-ww`: unlimited width, or a long argv silently truncates — the
+        # same false-negative shape a truncated /proc/PID/cmdline would be.
+        CMD[$pid]="$rest"
+        [ -n "${CMD[$pid]}" ] || CMD[$pid]="[?]"
+    done < <(ps -axwwo pid=,ppid=,pgid=,command= 2>/dev/null)
+}
+
+build_self_chain() {
+    local cur="$$" guard=0
+    while [ -n "$cur" ] && [ "$guard" -lt 10000 ]; do
+        SELF_CHAIN[$cur]=1
+        [ "$cur" = "1" ] && break
+        cur="${PPIDOF[$cur]:-}"
+        guard=$((guard + 1))
+    done
+}
+
+# descendants_of PID: every pid reachable by walking CHILDREN from PID
+# (PID itself excluded), one per line.
+descendants_of() {
+    local root="$1" cur kids k
+    if [ "$_SK_HAVE_ASSOC" -eq 1 ]; then local -A seen=(); else local -a seen=(); fi
+    local queue=("$root")
+    seen[$root]=1
+    while [ "${#queue[@]}" -gt 0 ]; do
+        cur="${queue[0]}"; queue=("${queue[@]:1}")
+        kids="${CHILDREN[$cur]:-}"
+        for k in $kids; do
+            if [ -z "${seen[$k]:-}" ]; then
+                seen[$k]=1
+                printf '%s\n' "$k"
+                queue+=("$k")
+            fi
+        done
+    done
+}
+
+pgid_exists() {
+    local pg="$1" p
+    for p in "${!PGRP[@]}"; do
+        [ "${PGRP[$p]}" = "$pg" ] && return 0
+    done
+    return 1
+}
+
+# members_of_pgids PGID...: every currently-known pid whose pgrp is one of
+# the given pgids (the live-ish snapshot membership), one per line.
+members_of_pgids() {
+    local pid pg
+    for pid in "${!PGRP[@]}"; do
+        for pg in "$@"; do
+            if [ "${PGRP[$pid]}" = "$pg" ]; then
+                printf '%s\n' "$pid"
+                break
+            fi
+        done
+    done
+}
+
+iso_of() {
+    if [ "$_SK_HAVE_PROC" -eq 1 ]; then
+        if [ -z "$BOOT_EPOCH" ]; then
+            local up
+            read -r up _ < /proc/uptime
+            BOOT_EPOCH="$(awk -v n="$(date +%s.%N)" -v u="$up" 'BEGIN{printf "%.0f", n-u}')"
+            CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+        fi
+        local ticks="${START[$1]:-0}" epoch
+        epoch=$(( BOOT_EPOCH + ticks / CLK_TCK ))
+        # -Iseconds (not GNU's -Is shorthand): identical output on GNU
+        # date, verified the only spelling BSD/macOS date accepts — kept
+        # here too (not just the darwin branch below) so both branches
+        # emit the same field shape.
+        date -d "@$epoch" -Iseconds 2>/dev/null || printf 'unknown'
+    else
+        # darwin: fetched LAZILY, per candidate, via `ps -o lstart=` — one
+        # call per pid actually printed in an audit line (a handful, at
+        # most the size of `matched`), never a bulk whole-box call. Moved
+        # off scan_procs_darwin's hot path deliberately: `lstart` feeds
+        # only the printed audit line, never a safety decision, so it does
+        # not need to share that function's single-call TOCTOU-narrowing
+        # argument — see that function's own header. BSD date's `-j -f`
+        # (parse-without-setting-the-clock) reads `ps`'s exact format; a
+        # trailing-space warning from its fixed-width padding is cosmetic
+        # and thrown away like every other diagnostic here.
+        local lstart
+        lstart="$(ps -o lstart= -p "$1" 2>/dev/null)"
+        [ -n "$lstart" ] || { printf 'unknown'; return; }
+        date -j -f '%a %b %e %H:%M:%S %Y' "$lstart" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null \
+            || printf 'unknown'
+    fi
+}
+
+audit_line() {
+    printf 'pid=%s pgid=%s start=%s cmd=%s' \
+        "$1" "${PGRP[$1]:-?}" "$(iso_of "$1")" "$(sq "${CMD[$1]:-?}")"
+}
+
+proc_alive() {
+    local line="" state=""
+    { read -r line < "/proc/$1/stat"; } 2>/dev/null
+    [ -n "$line" ] || return 1
+    line="${line##*) }"
+    state="${line%% *}"
+    [ "$state" != "Z" ]
+}
+
+scan_procs
+build_self_chain
+
+# [MACPORT] SELF_CHAIN ALSO COVERS EVERY DESCENDANT OF $$, not only its
+# ancestors — verified live to be load-bearing, not defensive belt: darwin's
+# scan_procs_darwin uses `ps` via process substitution (`< <(ps ...)`),
+# which bash implements by FORKING a child to run `ps`. In the narrow
+# window between that fork() and its execve() into the real `ps` binary,
+# the forked child is still a byte-for-byte copy of safekill's OWN process
+# image — same argv, same command text — and `ps`'s own system-wide
+# snapshot can catch that child in exactly this pre-exec instant,
+# reporting a PID that is neither $$ nor an ancestor of it but whose
+# reported cmdline is "bash .../safekill -f PATTERN" all the same.
+# Reproduced live, deterministically, with a plain `-f` search matching
+# NOTHING else on the box: the transient fork's own pid still matched the
+# pattern (since it echoed safekill's own invocation), ancestor-chain
+# exclusion could not see it (it is a CHILD, not a parent), and safekill
+# went on to SIGTERM its own process GROUP — which on this fork-heavy
+# scan path includes its own still-running `ps` helper. A descendant is
+# exactly as safe to exclude as an ancestor: nothing this process forked
+# for its OWN bookkeeping is ever a legitimate kill target.
+while IFS= read -r _sk_d; do
+    [ -n "$_sk_d" ] && SELF_CHAIN[$_sk_d]=1
+done < <(descendants_of "$$")
+
+# ---- resolve the target set -------------------------------------------------
+
+doomed_pgids=()
+
+case "$mode" in
+    pid)
+        if [ -z "${PGRP[$target_pid]:-}" ]; then
+            printf '%s: no such PID: %s\n' "$prog" "$target_pid" >&2
+            exit 1
+        fi
+        if [ "$_SK_HAVE_ASSOC" -eq 1 ]; then declare -A pgset=(); else declare -a pgset=(); fi
+        pgset["${PGRP[$target_pid]}"]=1
+        while IFS= read -r d; do
+            [ -n "$d" ] && pgset["${PGRP[$d]:-0}"]=1
+        done < <(descendants_of "$target_pid")
+        doomed_pgids=("${!pgset[@]}")
+        ;;
+    pgid)
+        if ! pgid_exists "$target_pgid"; then
+            printf '%s: no such process group: %s\n' "$prog" "$target_pgid" >&2
+            exit 1
+        fi
+        doomed_pgids=("$target_pgid")
+        ;;
+    pattern)
+        matched=()
+        for p in "${!CMD[@]}"; do
+            if [[ "${CMD[$p]}" =~ $pattern ]]; then
+                matched+=("$p")
+            fi
+        done
+        if [ -n "$opt_under" ]; then
+            if [ "$_SK_HAVE_ASSOC" -eq 1 ]; then declare -A under_set=(); else declare -a under_set=(); fi
+            while IFS= read -r d; do [ -n "$d" ] && under_set[$d]=1; done \
+                < <(descendants_of "$opt_under")
+            filtered=()
+            for p in "${matched[@]}"; do
+                [ -n "${under_set[$p]:-}" ] && filtered+=("$p")
+            done
+            matched=("${filtered[@]}")
+        fi
+        if [ -n "$opt_cwd" ]; then
+            want_dir="$(cd "$opt_cwd" 2>/dev/null && pwd -P)" \
+                || die_usage "--cwd: no such directory: $opt_cwd"
+            filtered=()
+            for p in "${matched[@]}"; do
+                if [ "$_SK_HAVE_PROC" -eq 1 ]; then
+                    pcwd="$(readlink -f "/proc/$p/cwd" 2>/dev/null)" || pcwd=""
+                else
+                    # darwin: no /proc/PID/cwd. `lsof`'s own `-d cwd` fd
+                    # selector answers the identical question — it ships
+                    # standard on macOS, so this needs no new dependency.
+                    # `-Fn` gives one 'n'-prefixed line with the path; a
+                    # process this UID cannot inspect (or one already gone)
+                    # prints nothing, the same "unreadable" shape /proc's
+                    # readlink failure has on Linux.
+                    pcwd="$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+                fi
+                if [ -z "$pcwd" ]; then
+                    # cwd unreadable (permission, or the process already
+                    # exited) — excluded, not a hard error, but COUNTED so
+                    # a caller can tell "no match" from "matches existed
+                    # but were unreadable" without a new exit code.
+                    cwd_unreadable_count=$((cwd_unreadable_count + 1))
+                    continue
+                fi
+                case "$pcwd" in
+                    "$want_dir"|"$want_dir"/*) filtered+=("$p") ;;
+                esac
+            done
+            matched=("${filtered[@]}")
+        fi
+        # Self/ancestor exclusion — unconditional, no override flag (see
+        # header: this is the one guard the incidents show a human cannot
+        # reliably apply by hand, so it does not get a bypass).
+        filtered=()
+        for p in "${matched[@]}"; do
+            [ -n "${SELF_CHAIN[$p]:-}" ] && continue
+            filtered+=("$p")
+        done
+        matched=("${filtered[@]}")
+        ;;
+esac
+
+# cwd_note: appended to any message reporting a candidate COUNT for -f
+# mode, so "no match" is never confused with "matches existed but their
+# cwd could not be read" (permission, or the process already exited) —
+# same count, different meaning, and this is the only place that
+# distinction is visible without inventing a new exit code.
+cwd_note=""
+if [ -n "$opt_cwd" ] && [ "$cwd_unreadable_count" -gt 0 ]; then
+    cwd_note=" (note: $cwd_unreadable_count candidate(s) excluded from --cwd matching because their cwd could not be read — re-run with --list and without --cwd to see them)"
+fi
+
+# ---- --list: preview only, never signals anything --------------------------
+
+if [ "$opt_list" -eq 1 ]; then
+    if [ "$mode" = "pattern" ]; then
+        list_pids=("${matched[@]}")
+    else
+        # [MACPORT] `mapfile` (bash 4.0+) does not exist on bash 3.2
+        # (this box's own /bin/bash) — verified live ("command not found").
+        # A portable read loop is the bash-3.0-safe equivalent.
+        list_pids=()
+        while IFS= read -r _sk_p; do list_pids+=("$_sk_p"); done \
+            < <(members_of_pgids "${doomed_pgids[@]}")
+    fi
+    for p in "${list_pids[@]}"; do
+        audit_line "$p"
+        printf '\n'
+    done
+    if [ "${#list_pids[@]}" -gt 0 ]; then
+        exit 0
+    fi
+    [ -n "$cwd_note" ] && printf '%s: no candidates matched%s\n' "$prog" "$cwd_note" >&2
+    exit 1
+fi
+
+# ---- pattern mode: refuse-by-default on ambiguity ---------------------------
+
+if [ "$mode" = "pattern" ]; then
+    count="${#matched[@]}"
+    if [ "$count" -eq 0 ]; then
+        printf '%s: no candidates matched (after exclusions): %s%s\n' "$prog" "$pattern" "$cwd_note" >&2
+        exit 1
+    fi
+    if [ "$count" -gt 1 ] && [ "$opt_all" -ne 1 ]; then
+        printf '%s: refused — %d candidates matched '"'"'%s'"'"' after exclusions%s; re-run with --all to widen, or --list to preview without killing:\n' \
+            "$prog" "$count" "$pattern" "$cwd_note" >&2
+        for p in "${matched[@]}"; do
+            printf '  %s\n' "$(audit_line "$p")" >&2
+        done
+        exit 2
+    fi
+    if [ "$_SK_HAVE_ASSOC" -eq 1 ]; then declare -A pgset=(); else declare -a pgset=(); fi
+    # [MACPORT] `:-0`: on darwin, PGRP/CMD come from two SEPARATE `ps`
+    # snapshots (scan_procs_darwin), not one atomic /proc walk, so a
+    # process that appears in the command scan can legitimately be absent
+    # from the earlier pgid scan (a race, same TOCTOU class this file's
+    # header already accepts elsewhere) — verified live under bash 3.2,
+    # not a hypothetical: an unguarded reference here crashed with
+    # "unbound variable" under `set -u`. `0` is a safe sentinel (matches no
+    # real pgid), same fallback line ~523's descendant-walk already uses.
+    for p in "${matched[@]}"; do pgset["${PGRP[$p]:-0}"]=1; done
+    doomed_pgids=("${!pgset[@]}")
+fi
+
+# [MACPORT] mapfile (bash 4.0+) is absent on bash 3.2 — same portable
+# read-loop replacement as the --list branch above.
+kill_pids=()
+while IFS= read -r _sk_p; do kill_pids+=("$_sk_p"); done \
+    < <(members_of_pgids "${doomed_pgids[@]}")
+if [ "${#kill_pids[@]}" -eq 0 ]; then
+    printf '%s: nothing left to kill (already gone)\n' "$prog" >&2
+    exit 1
+fi
+
+neg_pgids=()
+for pg in "${doomed_pgids[@]}"; do neg_pgids+=("-$pg"); done
+
+if [ "$opt_killnow" -eq 1 ]; then
+    final_signal="KILL"
+else
+    final_signal="$opt_signal"
+fi
+
+# Audit line printed BEFORE the signal is sent, not after: a TERM landing
+# on this script's own accounting is exactly incident B's failure mode in
+# miniature (SIGTERM reached the victim with zero record of what died).
+# bash's `printf` builtin issues one write(2) per call — there is no
+# userspace stdio buffer to flush here, so write-then-kill is sufficient
+# ordering by itself, no explicit flush needed.
+for p in "${kill_pids[@]}"; do
+    printf '%s: kill %s signal=%s\n' "$prog" "$(audit_line "$p")" "$final_signal" >&2
+done
+# kill(2) targets the GROUP (negative pgid), not the individually
+# snapshotted pids above, so a member that already exited between the
+# /proc scan and here (TOCTOU) is simply not there to receive the signal
+# — no per-pid ESRCH to handle. If the ENTIRE recorded group has already
+# vanished, `kill` itself returns nonzero (ESRCH) for that pgid; its exit
+# status is deliberately not checked here — that failure means "already
+# dead", which is success for this tool's purpose, not an error to
+# surface or retry.
+kill -s "$final_signal" -- "${neg_pgids[@]}" 2>/dev/null
+
+escalated=0
+if [ "$opt_killnow" -ne 1 ] && [ "$opt_termonly" -ne 1 ]; then
+    waited="0"
+    while awk -v w="$waited" -v g="$opt_grace" 'BEGIN{exit !(w<g)}'; do
+        any_alive=0
+        for p in "${kill_pids[@]}"; do
+            proc_alive "$p" && { any_alive=1; break; }
+        done
+        [ "$any_alive" -eq 1 ] || break
+        sleep 0.2
+        waited="$(awk -v w="$waited" 'BEGIN{printf "%.3f", w+0.2}')"
+    done
+    survivors=()
+    for p in "${kill_pids[@]}"; do
+        proc_alive "$p" && survivors+=("$p")
+    done
+    if [ "${#survivors[@]}" -gt 0 ]; then
+        escalated=1
+        # Same write-then-kill discipline as the initial signal above.
+        for p in "${survivors[@]}"; do
+            printf '%s: escalate pid=%s signal=KILL (grace %ss exceeded)\n' \
+                "$prog" "$p" "$opt_grace" >&2
+        done
+        kill -s KILL -- "${neg_pgids[@]}" 2>/dev/null
+    fi
+fi
+
+printf '%s: done — signalled %d process(es) across %d group(s), mode=%s signal=%s escalated=%s\n' \
+    "$prog" "${#kill_pids[@]}" "${#doomed_pgids[@]}" "$mode" "$final_signal" "$escalated" >&2
+exit 0
