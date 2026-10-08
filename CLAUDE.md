@@ -1,7 +1,8 @@
 # mouse-tickler: a lean "shake to find cursor" GNOME Shell extension
 
 A clean-room rewrite of github.com/mattpass/jiggle for GNOME Shell 50
-(Wayland only). Start with the design in `docs/design/` (README.md is the
+(Wayland only). **When resuming, read `docs/dev/journal.md` first**: it holds
+the status and next steps. The design is in `docs/design/` (README.md is the
 index).
 
 ## Scope
