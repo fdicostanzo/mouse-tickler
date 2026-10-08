@@ -77,8 +77,27 @@ not against an absolute number. Record which renderer was used.
 |---|---|---|
 | M0 | Design docs (this set) | User review |
 | M1 | Spikes S1–S4, results added to doc 02 | **Done 2026-10-07** (doc 02 §6) |
-| M2 | `detector.js` with unit tests | Unit tests pass |
-| M3 | `extension.js`, `sprite.js`, schema; integration tests | `make test-shell` passes |
+| M2 | `detector.js` with unit tests | **Done 2026-10-07**: 23 tests, each one checked by sabotage |
+| M3 | `extension.js`, `sprite.js`, schema; integration tests | **Done 2026-10-07**: 20 shell checks, including a 600-cycle enable/disable soak |
 | M4 | `prefs.js`, packaging, lint | `gnome-extensions pack` produces a clean zip |
 | M5 | Performance comparison and soak test | Budget in doc 03 §6 met; soak test passes |
 | M6 | The user installs it on their desktop as frank | Recovery playbook (doc 04 §3) acknowledged |
+
+## 6. Lessons from the first integration runs (2026-10-07)
+
+- `ClutterVirtualInputDevice.notify_button()` takes **Clutter** button
+  numbers (`Clutter.BUTTON_PRIMARY`), not evdev codes. With `0x110` the press
+  was silently dropped. Once the button number was right, `global.get_pointer()`
+  returned the button masks correctly (spike `s5-buttons.js`).
+- `GLib.timeout_add_seconds` is deliberately coarse and fired the safety cap
+  at 5.6 s. `timeout_add(5000)` is exact.
+- The shell's exit code is unreliable: the perf helper's teardown can race.
+  `make test-shell` judges success from the script's own `RESULT OK` line.
+- RSS after GC across 800 enable/disable cycles grows about 5.7 MB over the
+  first ~400 cycles and then stays flat (+0.2 MB over the last 400). The same
+  shaking without enable/disable (`MT_CONTROL=1`) stays flat. This is one-time
+  warm-up in GJS/GObject, not a leak. The soak check therefore asserts that
+  the last 200 of 600 cycles stay under 1 MB.
+- Size: the JS totals 518 lines (detector 183, extension 188, sprite 99,
+  prefs 48). That is over the 400-line target in doc 03 §1, mostly because of
+  comments and defensive code. Accepted for now and to be revisited in review.

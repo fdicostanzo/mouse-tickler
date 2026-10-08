@@ -2,6 +2,7 @@
 // enabled (make test-shell). Drives a virtual pointer and checks behaviour.
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import System from 'system';
 import Graphene from 'gi://Graphene';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -9,7 +10,6 @@ import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
 
 export const METRICS = {};
 const UUID = 'mouse-tickler@dicostanzo.com';
-const BTN_LEFT = 0x110;
 
 let failures = 0;
 function check(name, cond, detail = '') {
@@ -45,8 +45,13 @@ function hotspotOnScreen(e) {
     return [p.x, p.y];
 }
 
-async function settle(ms = 2000) {
-    await Scripting.sleep(ms);
+// Wait until the effect is fully at rest (or `ms` passes).
+async function settle(ms = 3000) {
+    const e = ext();
+    const t0 = now();
+    while (e?._active && now() - t0 < ms * 1000)
+        await Scripting.sleep(20);
+    await Scripting.sleep(100);
 }
 
 export async function run() {
@@ -105,23 +110,30 @@ export async function run() {
     await settle(500);
 
     // Mouse button held: no activation (painting/dragging).
-    dev.notify_button(now(), BTN_LEFT, Clutter.ButtonState.PRESSED);
+    dev.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED);
     activated = false;
     await shake(900, {probe: () => { activated ||= e._active; }});
-    dev.notify_button(now(), BTN_LEFT, Clutter.ButtonState.RELEASED);
+    dev.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
     check('button held: no activation', !activated);
     await settle(500);
 
-    // Safety cap: continuous shaking for 6.5 s ends the effect at ~5 s.
-    let capAt = -1, wasActive = false;
+    // Safety cap: continuous shaking ends the effect ~5 s after it started,
+    // and the real cursor is visible again at that moment.
+    let startAt = -1, capAt = -1, visibleAtCap = false;
     await shake(6500, {probe: el => {
-        wasActive ||= e._active;
-        if (wasActive && !e._active && capAt < 0)
+        if (startAt < 0 && e._active)
+            startAt = el;
+        if (startAt >= 0 && capAt < 0 && !e._active) {
             capAt = el;
+            visibleAtCap = tracker.get_pointer_visible();
+        }
     }});
-    check('safety cap ends a 6.5 s shake', wasActive && capAt > 4500 && capAt < 6000, `capAt=${capAt.toFixed(0)} ms`);
-    check('R1: cursor visible after cap', tracker.get_pointer_visible());
+    const ran = capAt - startAt;
+    check('safety cap ends a long shake after ~5 s', startAt >= 0 && ran > 4800 && ran < 5400,
+        `active for ${ran.toFixed(0)} ms`);
+    check('R1: cursor visible at cap', visibleAtCap);
     await settle();
+    check('R1: cursor visible after cap + rest', tracker.get_pointer_visible());
 
     // Disable while active: cursor restored, actor destroyed.
     await shake(900);
@@ -133,8 +145,19 @@ export async function run() {
     check('overlay destroyed on disable', uiCount() === 0, `count=${uiCount()}`);
 
     // Enable/disable cycles with shakes in between: no leaks, cursor visible.
-    const rss0 = rssKb();
-    for (let i = 0; i < 200; i++) {
+    // MT_CYCLES / MT_CONTROL: soak length and a control run that shakes
+    // without enabling the extension (baseline shell growth).
+    const cycles = Number(GLib.getenv('MT_CYCLES') ?? 600);
+    const control = GLib.getenv('MT_CONTROL') === '1';
+    const rss = [];
+    for (let i = 0; i < cycles; i++) {
+        if (i % 100 === 0)
+            rss.push(rssAfterGc());
+        if (control) {
+            if (i % 20 === 0)
+                await shake(700, {amp: 120});
+            continue;
+        }
         await Main.extensionManager._callExtensionEnable(UUID);
         if (i % 20 === 0) {
             e = ext();
@@ -142,14 +165,22 @@ export async function run() {
         }
         await Main.extensionManager._callExtensionDisable(UUID);
     }
-    check('R1: cursor visible after 200 cycles', tracker.get_pointer_visible());
+    rss.push(rssAfterGc());
+    check('R1: cursor visible after 300 cycles', tracker.get_pointer_visible());
     check('no overlay actors left after cycles', uiCount() === 0, `count=${uiCount()}`);
-    print(`info: RSS ${rss0} -> ${rssKb()} kB over 200 cycles`);
+    print(`info: RSS after GC every 100 cycles${control ? ' (CONTROL)' : ''}: ${rss.join(' / ')} kB`);
+    const tail = rss[rss.length - 1] - rss[rss.length - 3];
+    check('RSS flat over the last 200 cycles (< 1 MB)', tail < 1024, `${tail} kB`);
     await Main.extensionManager._callExtensionEnable(UUID);
 
     print(`RESULT ${failures === 0 ? 'OK' : `${failures} FAILED`}`);
     if (failures)
         throw new Error(`${failures} checks failed`);
+}
+
+function rssAfterGc() {
+    System.gc();
+    return rssKb();
 }
 
 function rssKb() {

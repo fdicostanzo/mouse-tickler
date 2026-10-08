@@ -12,7 +12,7 @@ import {CursorOverlay} from './sprite.js';
 
 const THROTTLE_US = 4000;        // max ~250 detector updates/s (spike S1)
 const ACTIVATE_AT = 1.15;        // target scale that shows the overlay
-const MAX_ACTIVE_S = 5;          // safety cap (risk R1)
+const MAX_ACTIVE_MS = 5000;      // safety cap (risk R1)
 const COOLDOWN_US = 1000000;     // after the cap or an error
 const BUTTONS = Clutter.ModifierType.BUTTON1_MASK |
     Clutter.ModifierType.BUTTON2_MASK | Clutter.ModifierType.BUTTON3_MASK |
@@ -126,7 +126,7 @@ export default class MouseTicklerExtension extends Extension {
         this._timeline.connect('new-frame', () => this._onFrame());
         this._timeline.start();
 
-        this._capId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, MAX_ACTIVE_S, () => {
+        this._capId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, MAX_ACTIVE_MS, () => {
             this._capId = 0;
             this._rest(COOLDOWN_US);
             return GLib.SOURCE_REMOVE;

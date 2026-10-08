@@ -16,8 +16,12 @@ test-unit:
 	gjs -m tests/detector_test.js
 
 # Heavy: headless gnome-shell. Ask pcrecdev1 for a window first (CLAUDE.md).
+# Verdict is the script's own RESULT line: the shell's exit code also
+# reflects unrelated perf-helper teardown races.
 test-shell: $(ZIP)
-	tests/spikes/run-spike.sh tests/shell/shake.js build/test-shell.log $(ZIP)
+	-tests/spikes/run-spike.sh tests/shell/shake.js build/test-shell.log $(ZIP)
+	@grep -E '^(FAIL|RESULT)' build/test-shell.log
+	@grep -q '^RESULT OK' build/test-shell.log
 
 clean:
 	rm -rf build
