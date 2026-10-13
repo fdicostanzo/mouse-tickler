@@ -11,7 +11,8 @@ const GAP_RESET = 200;       // ms without motion starts a fresh gesture
 const WINDOW = 600;          // ms, reversals counted within this window
 const V0 = 300;              // px/s, speed at which growth starts
 const ATTACK = 40;           // ms, growth time constant
-const RELEASE = 150;         // ms, shrink time constant
+const RELEASE = 60;          // ms, shrink time constant
+const STILL = 200;           // ms without motion: the pointer has stopped
 const MAX_FRAME_DT = 100;    // ms; a longer gap (first frame) counts as one frame
 const FRAME_DT = 16;
 
@@ -35,15 +36,13 @@ export class ShakeDetector {
      * @param {number} [c.sensitivity] 1..10, higher triggers more easily
      * @param {number} [c.growth] scale added per 1000 px/s above V0
      * @param {number} [c.maxScale] upper bound of the scale
-     * @param {number} [c.holdMs] hold time before shrinking
      */
-    configure({sensitivity = 5, growth = 1.4, maxScale = 4, holdMs = 300} = {}) {
+    configure({sensitivity = 5, growth = 1.4, maxScale = 4} = {}) {
         const s = clamp(Math.round(num(sensitivity, 5)), 1, 10);
         this._nRev = s <= 3 ? 4 : s <= 7 ? 3 : 2;
         this._minLeg = 40 * 1.25 ** (5 - s);
         this._gain = clamp(num(growth, 1.4), 0, 10) / 1000;
         this._maxScale = clamp(num(maxScale, 4), 1, 16);
-        this._hold = clamp(num(holdMs, 300), 0, 5000);
     }
 
     reset() {
@@ -57,9 +56,9 @@ export class ShakeDetector {
         this._legLen = 0;
         this._rev.fill(-Infinity);
         this._head = 0;
+        this._on = false;
         this._scale = 1;
         this._frameT = -Infinity;
-        this._holdUntil = -Infinity;
     }
 
     /**
@@ -73,6 +72,8 @@ export class ShakeDetector {
         if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(t))
             return;
 
+        if (t - this._pt > STILL)
+            this._on = false;
         if (!this._have || t < this._pt || t - this._pt > GAP_RESET) {
             this._startGesture(x, y, t);
             return;
@@ -102,6 +103,9 @@ export class ShakeDetector {
             if (this._legLen >= this._minLeg) {
                 this._rev[this._head] = t;
                 this._head = (this._head + 1) % RING;
+                // Latch shake mode: from here on the size follows speed
+                // alone until the pointer stops or the size settles at 1.
+                this._on ||= this.shaking(t);
             }
             this._lx = dx;
             this._ly = dy;
@@ -142,9 +146,9 @@ export class ShakeDetector {
         return this._v * Math.exp(-idle / TAU_V);
     }
 
-    /** Scale the cursor should head towards; 1 when not shaking. */
+    /** Scale the cursor should head towards; 1 outside shake mode. */
     target(now) {
-        if (!this.shaking(now))
+        if (!this._on)
             return 1;
         return clamp(1 + this._gain * (this.speed(now) - V0), 1, this._maxScale);
     }
@@ -160,18 +164,22 @@ export class ShakeDetector {
         if (dt > MAX_FRAME_DT)
             dt = FRAME_DT;
         this._frameT = now;
+        if (this._have && now - this._pt > STILL) {
+            // The pointer stopped. Speed has been decaying since the last
+            // sample, so the size has mostly shrunk already; end the mode.
+            this.reset();
+            return 1;
+        }
         const target = this.target(now);
         let s = this._scale;
+        const tau = target >= s ? ATTACK : RELEASE;
+        s += (target - s) * (1 - Math.exp(-dt / tau));
 
-        if (target >= s) {
-            s += (target - s) * (1 - Math.exp(-dt / ATTACK));
-            this._holdUntil = now + this._hold;
-        } else if (now >= this._holdUntil) {
-            s = Math.max(target, 1 + (s - 1) * Math.exp(-dt / RELEASE));
-        }
-
-        if (target <= 1 && s < 1.01)
+        if (target <= 1 && s < 1.01) {
+            // Slowed to normal speed: leave shake mode.
             s = 1;
+            this._on = false;
+        }
         this._scale = s;
         return s;
     }

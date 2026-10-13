@@ -32,8 +32,6 @@ export default class MouseTicklerPreferences extends ExtensionPreferences {
             'Size added per 1000 px/s of shake speed', 0.2, 5, 0.1, 1));
         group.add(spinRow(settings, 'max-scale', 'Maximum size',
             'Multiple of the normal cursor size', 1.5, 8, 0.5, 1));
-        group.add(spinRow(settings, 'hold-ms', 'Hold time',
-            'Milliseconds to stay large after shaking stops', 0, 2000, 50, 0));
 
         const fullscreen = new Adw.SwitchRow({
             title: 'Ignore fullscreen windows',

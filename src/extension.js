@@ -21,6 +21,7 @@ const BUTTONS = Clutter.ModifierType.BUTTON1_MASK |
 export default class MouseTicklerExtension extends Extension {
     enable() {
         this._tracker = global.backend.get_cursor_tracker();
+        this._seat = global.stage.get_context().get_backend().get_default_seat();
         this._detector = new ShakeDetector();
         this._overlay = null;
         this._timeline = null;
@@ -50,6 +51,7 @@ export default class MouseTicklerExtension extends Extension {
         this._settings = null;
         this._detector = null;
         this._tracker = null;
+        this._seat = null;
     }
 
     _loadSettings() {
@@ -58,7 +60,6 @@ export default class MouseTicklerExtension extends Extension {
             sensitivity: s.get_int('sensitivity'),
             growth: s.get_double('growth'),
             maxScale: s.get_double('max-scale'),
-            holdMs: s.get_int('hold-ms'),
         });
         this._ignoreFullscreen = s.get_boolean('ignore-fullscreen');
     }
@@ -115,8 +116,13 @@ export default class MouseTicklerExtension extends Extension {
         actor.show();
 
         if (!this._inhibited) {
-            this._tracker.inhibit_cursor_visibility();
+            // As the Magnifier does: in mutter 50 the cursor is hidden by
+            // dropping the seat's unfocus inhibit. Without our own hold the
+            // count reaches 0, the pointer loses focus, and mutter returns
+            // before clearing the hardware cursor (meta-sprite.c).
+            this._seat.inhibit_unfocus();
             this._inhibited = true;
+            this._tracker.inhibit_cursor_visibility();
         }
 
         this._cursorChangedId = this._tracker.connect('cursor-changed',
@@ -172,8 +178,13 @@ export default class MouseTicklerExtension extends Extension {
             this._overlay?.actor.hide();
         } finally {
             if (this._inhibited) {
+                // Visibility first, so the unfocus count never touches 0.
                 this._inhibited = false;
-                this._tracker.uninhibit_cursor_visibility();
+                try {
+                    this._tracker.uninhibit_cursor_visibility();
+                } finally {
+                    this._seat.uninhibit_unfocus();
+                }
             }
         }
     }
