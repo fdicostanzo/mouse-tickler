@@ -100,11 +100,24 @@ target = gateOpen ? clamp(1 + GAIN * (vEma - V0), 1, MAX_SCALE) : 1
 Defaults: `V0 = 300 px/s`, `GAIN = 1.4 per 1000 px/s`, `MAX_SCALE = 4`. With
 these values a vigorous shake (about 2,500 px/s) reaches roughly 4×.
 
+**Shake mode** latches. The gate only decides when shake mode starts: the
+reversal that opens it turns the mode on, and from then on the target follows
+`vEma` alone, whether or not reversals continue. The speed estimate decays
+while no samples arrive, so slowing down shrinks the cursor, and speeding up
+grows it again. The mode ends when either:
+
+- no motion has arrived for `STILL` ms (200, about 12 frames at 60 Hz): the
+  pointer has stopped. By then the decayed speed has already shrunk the cursor
+  to about 1.2×, so the final step to 1 is small; or
+- the speed has fallen below `V0` and the displayed size has settled at 1.
+
 **Displayed size** is updated each frame while ACTIVE:
 
 - When `target > s`, move toward it quickly: `s += (target - s) * (1 - exp(-dt/40ms))`.
-- When `target < s`, keep the current size for `HOLD` ms (default 300) after
-  the gate last saw a reversal. This fixes #73. Then decay with `tau = 150 ms`.
+- When `target < s`, follow it down with `tau = 60 ms`. There is no hold: the
+  size tracks the latest movement, so it may dip a little at each reversal of
+  a shake. A full stop from a vigorous shake takes about 200 ms to return to
+  rest.
 - Size is a continuous function of the input. Nothing restarts an animation,
   so the grow, shrink, grow loop of Jiggle #74 cannot happen.
 
@@ -174,7 +187,6 @@ Doc 05 says how each row of this table is measured.
 | `sensitivity` | i 1–10 | 5 | How easily a shake triggers. Maps to N_REV, MIN_LEG and WINDOW. |
 | `max-scale` | d 1.5–8 | 4.0 | Upper bound on the scale. |
 | `growth` | d 0.2–5 | 1.4 | GAIN: scale added per 1000 px/s. |
-| `hold-ms` | i 0–2000 | 300 | How long to hold the size after shaking stops. |
 | `ignore-fullscreen` | b | true | Suppress activation over fullscreen windows. |
 
 Values are read once on enable and again on `changed::`. The hot path never

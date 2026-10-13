@@ -91,7 +91,7 @@ export async function run() {
             `err=${maxHotErr.toFixed(2)} scale=${e._overlay.actor.scale_x.toFixed(2)}`);
     }
 
-    // Stop: returns to rest within hold (300 ms) + 1.5 s.
+    // Stop: shrinks and returns to rest within STILL (200 ms); allow 1.5 s.
     const tStop = now();
     while (e._active && now() - tStop < 3000000)
         await Scripting.sleep(20);

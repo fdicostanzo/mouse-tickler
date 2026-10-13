@@ -17,11 +17,6 @@
       <default>1.4</default>
       <summary>Size added per 1000 px/s of shake speed</summary>
     </key>
-    <key name="hold-ms" type="i">
-      <range min="0" max="2000"/>
-      <default>300</default>
-      <summary>Milliseconds to keep the size after shaking stops</summary>
-    </key>
     <key name="ignore-fullscreen" type="b">
       <default>true</default>
       <summary>Do not trigger over fullscreen windows</summary>

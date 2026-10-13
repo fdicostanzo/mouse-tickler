@@ -97,23 +97,51 @@ const sine = (amp, hz, cx = 640, cy = 360) =>
     check('gentle wiggle stays under activation', r.maxTarget < 1.15, `maxTarget=${r.maxTarget}`);
 }
 
-// --- hold, decay, rest -----------------------------------------------------
+// --- shake mode, shrink, rest ------------------------------------------------
 {
-    const d = new ShakeDetector({holdMs: 300});
+    // Pointer stops dead after a shake: shrinks as speed decays, then rest.
+    const d = new ShakeDetector();
     const r = drive(d, sine(150, 4));
     const peak = d.advance(r.end);
-    // Pointer stops: no more samples.
-    const held = d.advance(r.end + 200);
-    check('holds size after shake stops', held >= peak * 0.95, `peak=${peak} held=${held}`);
-    let t = r.end + 200, s = held;
-    for (; t < r.end + 3000 && s > 1; t += 16)
+    let tf = r.end, v = peak;
+    const frames = ms => {
+        for (tf += 16; tf <= r.end + ms; tf += 16)
+            v = d.advance(tf);
+        tf -= 16;
+        return v;
+    };
+    const mid = frames(80);
+    check('shrinks at once when the pointer stops', mid < peak * 0.8 && mid > 1.2,
+        `peak=${peak} mid=${mid}`);
+    const late = frames(192);
+    check('nearly back to normal before the stop is final', late < 1.4, `late=${late}`);
+    const s = d.advance(r.end + 210);
+    check('rest once the pointer has stopped', s === 1 && d.atRest, `s=${s}`);
+    check('no re-trigger right after the stop', d.target(r.end + 220) === 1);
+}
+{
+    // Shake mode latches: after the shake, a fast straight move keeps the
+    // cursor large (no reversals needed), and slowing down shrinks it.
+    const d = new ShakeDetector();
+    const r = drive(d, sine(150, 4));
+    const [x0] = sine(150, 4)(r.end - 1000);
+    const fast = drive(d, t => [x0 + 2.5 * t, 360], {ms: 200, t0: r.end});
+    const big = d.advance(fast.end);
+    check('size follows speed after the shake', big > 3, `big=${big}`);
+    const x1 = x0 + 2.5 * (fast.end - r.end);
+    let t = fast.end, s = big;
+    for (; t < fast.end + 2000 && s > 1; t += 8) {
+        d.push(x1 + 0.2 * (t - fast.end), 360, t);
         s = d.advance(t);
-    check('returns exactly to rest', s === 1 && d.atRest, `s=${s}`);
-    check('returns to rest within hold + 1.5 s', t - r.end <= 1800, `took=${t - r.end}ms`);
+    }
+    check('slowing to normal speed returns exactly to rest', s === 1 && d.atRest, `s=${s}`);
+    check('returns to rest within 500 ms of slowing', t - fast.end <= 500,
+        `took=${t - fast.end}ms`);
+    check('normal motion after rest does not regrow', d.target(t) === 1);
 }
 {
     // Continuous shaking must not oscillate (Jiggle #74): after the
-    // initial growth, the displayed size should never fall far.
+    // initial growth, the size may dip at reversals but never falls far.
     const d = new ShakeDetector();
     let min = Infinity, grown = false;
     const f = sine(150, 4);
@@ -159,10 +187,10 @@ const sine = (amp, hz, cx = 640, cy = 360) =>
     check('warps stay within maxScale', r.maxScale <= 4 && r.maxTarget <= 4);
 }
 {
-    const d = new ShakeDetector({sensitivity: 'x', growth: NaN, maxScale: -3, holdMs: 1e12});
+    const d = new ShakeDetector({sensitivity: 'x', growth: NaN, maxScale: -3});
     const r = drive(d, sine(150, 4));
     check('bad config is clamped', r.maxScale === 1, `maxScale=${r.maxScale}`);
-    const d2 = new ShakeDetector({growth: NaN, maxScale: NaN, holdMs: NaN});
+    const d2 = new ShakeDetector({growth: NaN, maxScale: NaN});
     const r2 = drive(d2, sine(150, 4));
     check('NaN config falls back to defaults', r2.maxScale > 2 && r2.maxScale <= 4,
         `maxScale=${r2.maxScale}`);

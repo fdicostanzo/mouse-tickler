@@ -46,7 +46,7 @@ Each spike is a throwaway headless run that answers one question.
    and asserts the following:
    - the actor appears, the scale goes above 1, and the hotspot stays on the
      pointer position to within 1 px;
-   - after the shake stops, the extension deactivates within HOLD + 1 s;
+   - after the shake stops, the extension deactivates within STILL + 1 s;
    - `get_pointer_visible()` is true again after every scenario (R1);
    - nothing triggers while a button is held, while the cursor is hidden, or
      during a fullscreen test window;
