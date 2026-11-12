@@ -143,3 +143,57 @@ must never crash the user's desktop. Ship it as a GNOME Shell extension.
 - The scratch dirs `/tmp/claude-mt` and `/tmp/mt-src` (Jiggle and mutter
   clones, and the jiggle.zip patched to shell-version 50) are temporary and
   may be gone. Re-clone if needed.
+
+---
+
+## 2026-11-12 — Session 2: handoff from frank's clone, push, pack
+
+### What was done
+
+1. **Handoff picked up** from `/tmp/mouse-tickler-handoff/`. It was written by
+   the session in frank's clone, which has no GitHub credentials. It held a
+   bundle and patches for two commits based on `2e31788`:
+   - frank's "fixed double mouse and shrink delay": shake mode latches and
+     size follows speed, the double cursor is fixed, and the `hold-ms`
+     setting is removed;
+   - "Disconnect the frame timeline's signal on deactivate" (Shexli EGO-L-003).
+2. Local `main` was already one commit past that base (`78b9c96`, this
+   journal), so the bundle couldn't be pushed as is. The patches were applied
+   with `git am` on top of `78b9c96`, which gave `39e464d` and `9a5163c`.
+   The tree matched the bundle apart from the journal commit's own files.
+3. `make test-unit`: 28 passed, 0 failed. The shell tests weren't re-run here.
+   The handoff reports `make test-shell` 20/20 OK in frank's clone on the
+   same source.
+4. frank pushed `main` to origin (`78b9c96..9a5163c`). The push was run by
+   the user because the permission system blocked it for the agent.
+5. `make pack` built `build/mouse-tickler@dicostanzo.com.shell-extension.zip`
+   (8.1 KB, 7 entries, shell-version 50). It contains no `hold-ms`.
+
+### Status at end of session
+
+- `main` = `origin/main` = `9a5163c`. The working tree is clean apart from
+  this entry.
+- Shexli: 0 errors and 1 warning, EGO-L-002 (Clutter.Timeline not destroyed).
+  The warning is a false positive: a Timeline has no destroy(), and it is
+  stopped, disconnected and dropped in `_deactivate()`.
+
+### Next steps
+
+1. **frank uploads** the zip at https://extensions.gnome.org/upload/ with the
+   reviewer note: "Shexli EGO-L-002 on the Clutter.Timeline is a false
+   positive: a Timeline has no destroy(); it is stopped, disconnected and
+   dropped in `_deactivate()`, which `disable()` calls."
+2. Make sure github.com/fdicostanzo/mouse-tickler is public; the listing
+   links to it.
+3. Delete `/tmp/mouse-tickler-handoff/` (owned by frank).
+4. Items from session 1's plan that are still open: the docs cleanup for
+   publication, ESLint, a listing screenshot or GIF, and monitoring EGO and
+   GitHub feedback.
+
+### Notes
+
+- Shexli isn't installed in this clone. In frank's clone it was set up by
+  bootstrapping pip with a downloaded `get-pip.py`. Don't repeat that here
+  without the user's approval.
+- The handoff said to ask "pcrec-main" for a shell-test window. CLAUDE.md
+  says to ask `pcrecdev1`, so follow CLAUDE.md.
