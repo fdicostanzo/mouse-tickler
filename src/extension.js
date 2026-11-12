@@ -129,7 +129,7 @@ export default class MouseTicklerExtension extends Extension {
             () => this._overlay.refresh());
 
         this._timeline = new Clutter.Timeline({actor, duration: 1000, repeat_count: -1});
-        this._timeline.connect('new-frame', () => this._onFrame());
+        this._timeline.connectObject('new-frame', () => this._onFrame(), this);
         this._timeline.start();
 
         this._capId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, MAX_ACTIVE_MS, () => {
@@ -169,6 +169,7 @@ export default class MouseTicklerExtension extends Extension {
             }
             if (this._timeline) {
                 this._timeline.stop();
+                this._timeline.disconnectObject(this);
                 this._timeline = null;
             }
             if (this._cursorChangedId) {
